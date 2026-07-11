@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/out/
+web/.vercel/
+*.tsbuildinfo
+
+# Local data / legacy caches (now in Postgres)
+*.pkl
+*.csv
+cache_metadata.json
+*_progress.json
+*_partial.pkl
+stock_data_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
