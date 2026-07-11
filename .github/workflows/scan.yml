@@ -1,0 +1,43 @@
+name: scan
+
+# Self-driving market scan. Runs daily after the NSE close and on manual trigger.
+# The worker is a state machine: it backfills first (resuming if interrupted),
+# then switches to daily incremental updates automatically.
+on:
+  schedule:
+    # Every 15 min while backfilling (repo is public → free minutes), so a
+    # rate-limit pause resumes quickly instead of waiting for the next day.
+    # TODO: once the backfill finishes and the repo goes private, delete this
+    # line and keep only the 11:00 UTC daily cron below.
+    #- cron: "*/15 * * * *"
+    # 11:00 UTC = 16:30 IST ≈ an hour after the NSE close (15:30 IST), giving
+    # Yahoo's EOD data time to settle. Runs every day; weekend runs are cheap
+    # idempotent no-ops that also catch any missed weekday run.
+    - cron: "0 11 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button (use during initial backfill)
+
+concurrency:
+  group: scan
+  cancel-in-progress: false   # never interrupt an in-flight scan
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # well under the 6h hard cap; covers a full backfill
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r worker/requirements.txt
+
+      - name: Run scan
+        working-directory: worker
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -u run.py
