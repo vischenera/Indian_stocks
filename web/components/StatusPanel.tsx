@@ -31,12 +31,13 @@ export default function StatusPanel({ status }: { status: Status | null }) {
   const { run, backfill } = status;
   let badge = { text: "Unknown", cls: "bg-slate-700" };
 
-  if (!backfill.done) {
-    badge = { text: `Backfilling… ${backfill.pct}% (${backfill.cursor}/${backfill.total})`, cls: "bg-amber-600" };
-  } else if (run?.rate_limited) {
-    badge = { text: "Rate-limited — auto-retry next run", cls: "bg-orange-600" };
-  } else if (run?.status === "error") {
+  // Failures first: a backfill that keeps failing must not look like progress.
+  if (run?.status === "error") {
     badge = { text: "Last run failed", cls: "bg-rose-600" };
+  } else if (run?.rate_limited) {
+    badge = { text: "NSE throttled — resumes next run", cls: "bg-orange-600" };
+  } else if (!backfill.done) {
+    badge = { text: `Backfilling… ${backfill.pct}% (${backfill.cursor}/${backfill.total} days)`, cls: "bg-amber-600" };
   } else if (run?.status === "success") {
     badge = { text: "Up to date", cls: "bg-emerald-600" };
   } else if (run) {
@@ -55,6 +56,9 @@ export default function StatusPanel({ status }: { status: Status | null }) {
           </span>
         )}
       </div>
+      {run && (run.status === "error" || run.rate_limited) && run.message && (
+        <p className="mt-2 break-words text-xs text-slate-400">{run.message}</p>
+      )}
       {!backfill.done && (
         <div className="mt-3 h-2 w-full overflow-hidden rounded bg-slate-800">
           <div className="h-full bg-amber-500" style={{ width: `${backfill.pct}%` }} />

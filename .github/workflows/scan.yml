@@ -1,20 +1,22 @@
 name: scan
 
-# Self-driving market scan. Runs daily after the NSE close and on manual trigger.
-# The worker is a state machine: it backfills first (resuming if interrupted),
-# then switches to daily incremental updates automatically.
+# Self-driving market scan. Runs daily after NSE publishes the day's
+# end-of-day files, and on manual trigger. Every run ingests whatever trading
+# days are missing — the full ~90-day backfill on a fresh database (a few
+# minutes), then normally just the new day — so a missed or early run is
+# simply caught up by the next one.
 on:
   schedule:
-    # Every 15 min while backfilling (repo is public → free minutes), so a
-    # rate-limit pause resumes quickly instead of waiting for the next day.
-    # TODO: once the backfill finishes and the repo goes private, delete this
-    # line and keep only the 11:00 UTC daily cron below.
-    #- cron: "*/15 * * * *"
-    # 11:00 UTC = 16:30 IST ≈ an hour after the NSE close (15:30 IST), giving
-    # Yahoo's EOD data time to settle. Runs every day; weekend runs are cheap
-    # idempotent no-ops that also catch any missed weekday run.
-    - cron: "0 11 * * *"
-  workflow_dispatch: {}   # manual "Run workflow" button (use during initial backfill)
+    # 14:13 UTC = 19:43 IST. NSE's bhavcopy appears in the evening after the
+    # 15:30 IST close. An off-the-hour minute avoids GitHub's top-of-hour
+    # scheduling backlog (runs here have been starting hours late at :00).
+    - cron: "13 14 * * *"
+  workflow_dispatch:      # manual "Run workflow" button
+    inputs:
+      probe:
+        description: "Probe only: check NSE's files are reachable from GitHub (no database used)"
+        type: boolean
+        default: false
 
 concurrency:
   group: scan
@@ -23,13 +25,14 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # well under the 6h hard cap; covers a full backfill
+    timeout-minutes: 45   # a full backfill is ~150 small downloads
     steps:
       # Fail in seconds with an actionable message instead of a Python
       # traceback after a full pip install. An empty value here means the
       # secret is missing from *Repository secrets* (a Variable, an
       # Environment secret, or a Codespaces/Dependabot secret won't reach it).
       - name: Check DATABASE_URL secret
+        if: ${{ !inputs.probe }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
@@ -53,4 +56,4 @@ jobs:
         working-directory: worker
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python -u run.py
+        run: python -u run.py ${{ inputs.probe && '--probe' || '' }}

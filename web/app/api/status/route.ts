@@ -14,12 +14,14 @@ export async function GET() {
       FROM scan_runs ORDER BY id DESC LIMIT 1
     `;
     const phaseRow = await sql`SELECT value FROM job_state WHERE key = 'phase'`;
+    // Backfill progress is in trading days: cursor = days stored, total =
+    // the rolling window (worker/config.py WINDOW_DAYS).
     const cursorRow = await sql`SELECT value FROM job_state WHERE key = 'backfill_cursor'`;
-    const totalRow = await sql`SELECT count(*)::int AS n FROM tickers`;
+    const totalRow = await sql`SELECT value FROM job_state WHERE key = 'backfill_total'`;
 
     const phase = phaseRow[0]?.value ?? "backfill";
     const cursor = Number(cursorRow[0]?.value ?? 0);
-    const total = Number(totalRow[0]?.n ?? 0);
+    const total = Number(totalRow[0]?.value ?? 90);
     const pct = total > 0 ? Math.min(100, Math.round((cursor / total) * 100)) : 0;
 
     return NextResponse.json(

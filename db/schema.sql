@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS tickers (
     updated_at    TIMESTAMPTZ DEFAULT now()
 );
 
--- Rolling daily OHLCV (kept to ~90 trading days per symbol)
+-- Rolling daily OHLCV from NSE bhavcopies (last 90 trading days),
+-- back-adjusted for splits/bonuses.
 CREATE TABLE IF NOT EXISTS daily_ohlcv (
     symbol  TEXT NOT NULL REFERENCES tickers(symbol) ON DELETE CASCADE,
     date    DATE NOT NULL,
@@ -23,6 +24,18 @@ CREATE TABLE IF NOT EXISTS daily_ohlcv (
     PRIMARY KEY (symbol, date)
 );
 CREATE INDEX IF NOT EXISTS idx_ohlcv_symbol_date ON daily_ohlcv (symbol, date DESC);
+
+-- Trading dates the worker has resolved: 'ok' = that day's bhavcopy is
+-- ingested, 'holiday' = no file was published although a later day's was.
+-- Drives backfill/incremental: any date in the window not listed here is
+-- fetched on the next run.
+CREATE TABLE IF NOT EXISTS market_days (
+    date        DATE PRIMARY KEY,
+    status      TEXT NOT NULL,          -- 'ok' | 'holiday'
+    source      TEXT,                   -- file the day was ingested from
+    symbols     INTEGER,
+    fetched_at  TIMESTAMPTZ DEFAULT now()
+);
 
 -- One row per scan/fetch run (drives the dashboard "Data Status" panel)
 CREATE TABLE IF NOT EXISTS scan_runs (
@@ -77,7 +90,7 @@ ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS breakout_age   INTEGER;
 ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS breakout_score DOUBLE PRECISION;
 ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS slope3_pct_day DOUBLE PRECISION;
 
--- Tiny key/value store for the self-resuming backfill cursor & phase.
+-- Tiny key/value store: phase, backfill progress, metadata refresh dates.
 CREATE TABLE IF NOT EXISTS job_state (
     key         TEXT PRIMARY KEY,
     value       JSONB NOT NULL,
