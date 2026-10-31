@@ -25,9 +25,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350   # well under the 6h hard cap; covers a full backfill
     steps:
-      - uses: actions/checkout@v4
+      # Fail in seconds with an actionable message instead of a Python
+      # traceback after a full pip install. An empty value here means the
+      # secret is missing from *Repository secrets* (a Variable, an
+      # Environment secret, or a Codespaces/Dependabot secret won't reach it).
+      - name: Check DATABASE_URL secret
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error title=DATABASE_URL secret is missing::Add it at ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/settings/secrets/actions → 'New repository secret', name DATABASE_URL, value = your Neon connection string (postgresql://...?sslmode=require)."
+            exit 1
+          fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip

@@ -8,9 +8,9 @@ served from the DB and this module is only needed again for a re-seed.
 """
 
 import csv
+import http.client
 import io
 import time
-import urllib.error
 import urllib.request
 
 _SOURCES = (
@@ -25,6 +25,12 @@ _BACKOFF_SECONDS = 5
 # usually illiquid), SM/ST are the SME board — none of them scanner material.
 _SERIES_KEEP = {"EQ"}
 
+# Network failures worth retrying / falling through to the next source.
+# URLError and TimeoutError are OSError subclasses, but a CDN that drops the
+# connection mid-handshake raises http.client.RemoteDisconnected (an OSError
+# that urllib does NOT wrap in URLError) or IncompleteRead (an HTTPException).
+_NET_ERRORS = (OSError, http.client.HTTPException)
+
 
 def _download(url):
     req = urllib.request.Request(url, headers={
@@ -36,7 +42,7 @@ def _download(url):
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 return resp.read().decode("utf-8")
-        except (urllib.error.URLError, TimeoutError) as e:
+        except _NET_ERRORS as e:
             last_err = e
             if attempt < _RETRIES - 1:
                 time.sleep(_BACKOFF_SECONDS * (attempt + 1))
@@ -75,7 +81,7 @@ def get_all_nse_tickers():
                 dedup = {sym: name for sym, name in rows}
                 return sorted(dedup.items())
             last_err = RuntimeError(f"empty/unparseable universe from {url}")
-        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
+        except (*_NET_ERRORS, RuntimeError) as e:
             last_err = e
             print(f"universe source failed ({url}): {e}")
     raise RuntimeError(f"all NSE universe sources failed: {last_err}")

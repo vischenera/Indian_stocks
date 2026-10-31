@@ -33,7 +33,12 @@ GitHub Actions (worker)  →  Neon (Postgres)  →  Vercel (dashboard + read API
 
 ### 2. Worker (GitHub Actions)
 1. Add the connection string as a repo secret named **`DATABASE_URL`**
-   (Settings → Secrets and variables → Actions).
+   (Settings → Secrets and variables → **Actions** → *Secrets* tab →
+   **New repository secret**). It must be a *repository* secret: an Actions
+   *Variable*, an *Environment* secret, or a Codespaces/Dependabot secret is
+   not visible to the `scan` job, and setting it in Vercel does not set it
+   here. If it's missing, the `scan` run fails at its first step with
+   "DATABASE_URL secret is missing".
 2. Make the repo **public** for the initial backfill (unlimited free minutes),
    then trigger **Actions → scan → Run workflow**. Watch the dashboard's status
    panel show `Backfilling… %` until it reaches 100%.
