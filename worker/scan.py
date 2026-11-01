@@ -1,121 +1,200 @@
-"""Self-resuming scan orchestrator.
+"""Self-driving scan orchestrator — NSE bhavcopy edition.
 
-State machine driven by `job_state`:
-  phase = 'backfill'    → pull 90-day history for the universe in chunks,
-                          saving a cursor so runs resume where they left off.
-  phase = 'incremental' → fetch the last few days for every symbol.
+Every run performs the same idempotent steps:
 
-Either way, after updating data it recomputes metrics for every preset and
-writes a fresh scan_results set plus a scan_runs status row.
+  1. Weekly: refresh the universe (EQUITY_L) and industries (index lists).
+  2. Ingest every trading day in the window that isn't stored yet, oldest
+     first — one bhavcopy file per day covers the whole market. On a fresh
+     database that *is* the ~90-trading-day backfill (~145 small downloads,
+     a few minutes); after that a run normally fetches just the new day.
+  3. Trim to the last WINDOW_DAYS trading days; refresh market caps.
+  4. Recompute every preset → scan_results + a scan_runs status row.
+
+If NSE blocks us midway, everything ingested so far is kept and the next run
+continues from the first missing day. There is no cursor to babysit: the
+`market_days` table records which dates are done (or were closures).
 """
 
 import time
 import traceback
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 
 import config
 import db
-from datasource import RateLimited, get_source
+from datasource import SourceUnavailable, get_source
 from metrics import breakout_metrics, calculate_metrics
-from universe import get_all_nse_tickers
 
 PHASE_KEY = "phase"
-CURSOR_KEY = "backfill_cursor"
-PROGRESS_SAVE_EVERY = 10
+PROGRESS_KEY = "backfill_cursor"        # trading days stored (dashboard progress)
+PROGRESS_TOTAL_KEY = "backfill_total"   # = WINDOW_DAYS
+META_KEY = "meta_refreshed_on"
+MCAP_KEY = "mcap_date"
+
+IST = timezone(timedelta(hours=5, minutes=30))  # India has no DST
 
 
-def ensure_universe(conn):
-    """Populate the tickers table if empty (metadata filled during backfill)."""
-    symbols = db.all_symbols(conn)
-    if symbols:
-        return symbols
-    print("Universe empty — downloading NSE ticker list...")
-    tickers = get_all_nse_tickers()
-    db.upsert_tickers(conn, [(s, name, None, "NSE", None) for s, name in tickers])
-    print(f"Loaded {len(tickers)} symbols.")
-    return db.all_symbols(conn)
+def today_ist():
+    return datetime.now(IST).date()
 
 
-def _store_symbol(conn, symbol, bars, info=None):
-    """Upsert OHLCV (and optional ticker meta), then trim to the window."""
-    if not bars:
-        return False
-    db.upsert_ohlcv(conn, symbol, bars)
-    db.trim_ohlcv(conn, symbol, config.WINDOW_DAYS)
-    if info is not None:
-        name, sector, mcap = info
-        db.upsert_tickers(conn, [(symbol, name, sector, None, mcap)])
-    return True
+# ---------------------------------------------------------------------------
+# Metadata: universe, names, industries, market caps
+# ---------------------------------------------------------------------------
+
+def refresh_metadata(conn, src, today):
+    """Weekly universe/name/industry refresh. Returns a list of problems."""
+    last = db.get_state(conn, META_KEY)
+    if (last and db.count_tickers(conn)
+            and (today - date.fromisoformat(last)).days < config.META_REFRESH_DAYS):
+        return []
+    problems = []
+    try:
+        universe = src.fetch_universe()
+        db.sync_universe(conn, universe)
+        removed = db.prune_tickers(conn, {s for s, _ in universe})
+        print(f"Universe: {len(universe)} listed {'/'.join(config.NSE_SERIES)} symbols"
+              + (f", {removed} no longer listed removed" if removed else ""))
+        db.set_state(conn, META_KEY, today.isoformat())
+    except SourceUnavailable as e:
+        problems.append(f"universe: {e}")
+        print(f"WARNING: {problems[-1]}")
+    try:
+        industries = src.fetch_industries()
+        print(f"Industries: {db.update_sectors(conn, industries)} symbols tagged")
+    except SourceUnavailable as e:
+        problems.append(f"industries: {e}")
+        print(f"WARNING: {problems[-1]}")
+    return problems
 
 
-def backfill_step(conn, src, symbols):
-    """Process the next chunk. Returns (rate_limited, processed, errors, done)."""
-    cursor = int(db.get_state(conn, CURSOR_KEY, 0))
-    chunk = symbols[cursor:cursor + config.BACKFILL_CHUNK]
-    print(f"Backfill: cursor={cursor}/{len(symbols)}, chunk={len(chunk)}")
+def refresh_market_caps(conn, src):
+    """Market cap = issue size (shares, from NSE's MCAP file) × close.
 
-    processed = errors = valid = 0
-    rate_limited = False
-
-    for i, symbol in enumerate(chunk):
+    Uses the newest PR bundle among the last 3 ingested trading days; skipped
+    when already current. Returns a problem string or None.
+    """
+    current = db.get_state(conn, MCAP_KEY)
+    days = db.recent_ok_days(conn, 3)
+    for d in days:
+        if d.isoformat() == current:
+            return None          # already applied; nothing newer published yet
         try:
-            bars = src.fetch_history(symbol, config.WINDOW_DAYS)
-            info = src.fetch_info(symbol) if bars else None
-            if _store_symbol(conn, symbol, bars, info):
-                valid += 1
-            processed += 1
-        except RateLimited as exc:
-            print(f"Rate limited at {symbol}: {exc}. Stopping; will resume.")
-            rate_limited = True
-            break
-        except Exception:  # noqa: BLE001
-            errors += 1
-            traceback.print_exc()
-        # Advance cursor as we go so resume is granular.
-        if (i + 1) % PROGRESS_SAVE_EVERY == 0:
-            db.set_state(conn, CURSOR_KEY, cursor + i + 1)
-            print(f"Progress: {cursor + i + 1}/{len(symbols)} "
-                  f"({valid} valid, {processed} ok, {errors} errors)")
-
-    # Persist final cursor for this run.
-    new_cursor = cursor + (processed + errors)
-    reached_end = new_cursor >= len(symbols) and not rate_limited
-
-    # A full pass that yielded zero real data points to a systemic fetch
-    # problem (e.g. upstream blocking this IP range), not per-symbol gaps.
-    # Don't mark the backfill complete on that basis — retry the same range.
-    if reached_end and valid == 0 and len(chunk) > 0:
-        print(f"WARNING: 0/{len(chunk)} symbols returned data this run "
-              f"({processed} ok, {errors} errors) — not marking backfill "
-              "complete, will retry next run.")
-        db.set_state(conn, CURSOR_KEY, cursor)
-        return rate_limited, processed, errors, False
-
-    db.set_state(conn, CURSOR_KEY, new_cursor)
-    if reached_end:
-        db.set_state(conn, PHASE_KEY, "incremental")
-        db.set_state(conn, CURSOR_KEY, 0)
-        print("Backfill complete → switching to incremental mode.")
-    return rate_limited, processed, errors, reached_end
+            caps = src.fetch_market_caps(d)
+        except SourceUnavailable as e:
+            return f"market caps: {e}"
+        if caps is None:
+            continue
+        closes = db.closes_on(conn, d)
+        mcaps, ratios = {}, []
+        for sym, (issue, reported) in caps.items():
+            close = closes.get(sym)
+            if issue and close:
+                mcaps[sym] = int(round(issue * close))
+                if reported:
+                    ratios.append(reported / mcaps[sym])
+            elif reported:
+                mcaps[sym] = int(round(reported))
+        n = db.update_market_caps(conn, mcaps)
+        db.set_state(conn, MCAP_KEY, d.isoformat())
+        vals = sorted(mcaps.values())
+        median = vals[len(vals) // 2] if vals else 0
+        print(f"Market caps: {n} symbols from PR bundle {d} "
+              f"(median ₹{median / 1e7:,.0f} Cr)")
+        if ratios:
+            r = sorted(ratios)[len(ratios) // 2]
+            if abs(r - 1) > 0.05:
+                print(f"WARNING: NSE's own market-cap column differs from issue size × "
+                      f"close by a median factor of {r:.4g} — check MCAP units")
+        return None
+    if not days:
+        return None
+    return "market caps: no PR bundle for the last 3 trading days"
 
 
-def incremental_step(conn, src, symbols):
-    """Fetch the last few days for every symbol. Returns (rate_limited, processed, errors)."""
-    print(f"Incremental update for {len(symbols)} symbols")
-    processed = errors = 0
-    rate_limited = False
-    for symbol in symbols:
+# ---------------------------------------------------------------------------
+# Price ingestion
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IngestResult:
+    days_ok: int = 0
+    rows: int = 0
+    holidays: int = 0
+    pending: list = field(default_factory=list)   # no file yet, no later file either
+    blocked: str = ""                             # NSE unavailable (resumes next run)
+    error: str = ""                               # systemic: files not where expected
+
+    @property
+    def caught_up(self):
+        return not self.blocked and not self.error
+
+
+def days_to_fetch(known, today):
+    """Dates to try this run, oldest first.
+
+    Fresh database → the whole backfill window. Otherwise every date after
+    the newest ingested day. Older gaps are never back-filled out of order,
+    because split/bonus adjustment assumes days arrive chronologically.
+    """
+    start = today - timedelta(days=config.BACKFILL_CALENDAR_DAYS)
+    ok_days = [d for d, s in known.items() if s == "ok"]
+    if ok_days:
+        start = max(start, max(ok_days) + timedelta(days=1))
+    out, d = [], start
+    while d <= today:
+        if d not in known:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def ingest_days(conn, src, today, add_missing_tickers=False):
+    res = IngestResult()
+    todo = days_to_fetch(db.known_market_days(conn), today)
+    if todo:
+        print(f"Fetching up to {len(todo)} day(s): {todo[0]} → {todo[-1]}")
+    missing_weekdays = 0
+    for d in todo:
         try:
-            bars = src.fetch_history(symbol, config.INCREMENTAL_LOOKBACK_DAYS)
-            _store_symbol(conn, symbol, bars)
-            processed += 1
-        except RateLimited as exc:
-            print(f"Rate limited at {symbol}: {exc}. Stopping; will resume.")
-            rate_limited = True
+            got = src.fetch_bhavcopy(d)
+        except SourceUnavailable as e:
+            res.blocked = f"{d}: {e}"
+            print(f"NSE unavailable at {d}: {e}. Stopping; the next run resumes here.")
             break
-        except Exception:  # noqa: BLE001
-            errors += 1
-            traceback.print_exc()
-    return rate_limited, processed, errors
+        if got is None:
+            res.pending.append(d)
+            if d.weekday() < 5:
+                missing_weekdays += 1
+                if missing_weekdays >= config.MAX_CONSECUTIVE_MISSING_WEEKDAYS:
+                    res.error = (f"no bhavcopy published for {missing_weekdays} weekdays in a "
+                                 f"row ({res.pending[0]} → {d}) — NSE probably changed the "
+                                 "file URL; update config.BHAVCOPY_URLS")
+                    print(f"ERROR: {res.error}")
+                    break
+            continue
+
+        rows, source = got
+        n, adjusted, skipped = db.ingest_day(
+            conn, d, rows, source, add_missing_tickers,
+            config.ADJUST_MIN_DEVIATION, config.ADJUST_MAX_SHARE)
+        note = ""
+        if skipped:
+            note = (f" — {len(adjusted)} symbols' previous close didn't match stored "
+                    "history (data gap?); back-adjustment skipped for this day")
+        elif adjusted:
+            note = " — adjusted history for " + ", ".join(
+                f"{s} ×{r:.4g}" for s, r in adjusted[:8]) + (" …" if len(adjusted) > 8 else "")
+        print(f"  {d}: {n} symbols from {source}{note}")
+        # A later day's file exists, so the earlier gaps were market closures.
+        db.mark_holidays(conn, res.pending)
+        res.holidays += len(res.pending)
+        res.pending, missing_weekdays = [], 0
+        res.days_ok += 1
+        res.rows += n
+    if res.pending:
+        print(f"Not published yet: {', '.join(map(str, res.pending))} (retried next run)")
+    return res
 
 
 def evaluate_symbol(cfg, symbol, name, sector, mcap, bars, bm=None):
@@ -196,37 +275,120 @@ def compute_results(conn, run_id, symbols):
 def run_once():
     start = time.time()
     conn = db.get_conn()
+    run_id = None
     try:
         db.init_schema(conn)
-        symbols = ensure_universe(conn)
-        phase = db.get_state(conn, PHASE_KEY, "backfill")
         src = get_source()
+        today = today_ist()
+        phase = db.get_state(conn, PHASE_KEY, "backfill")
+        run_id = db.start_run(conn, phase, db.count_tickers(conn))
+        print(f"Run {run_id}: phase={phase}, today (IST) {today}")
 
-        run_id = db.start_run(conn, phase, len(symbols))
-        rate_limited = errors = processed = 0
-        done = False
+        problems = refresh_metadata(conn, src, today)
+        fallback = db.count_tickers(conn) == 0
+        if fallback:
+            problems.append("universe taken from the bhavcopy (EQUITY_L unavailable)")
+        ing = ingest_days(conn, src, today, add_missing_tickers=fallback)
+        db.trim_window(conn, config.WINDOW_DAYS)
+        mcap_problem = refresh_market_caps(conn, src)
+        if mcap_problem:
+            problems.append(mcap_problem)
+            print(f"WARNING: {mcap_problem}")
 
-        if phase == "backfill":
-            rate_limited, processed, errors, done = backfill_step(conn, src, symbols)
-        else:
-            rate_limited, processed, errors = incremental_step(conn, src, symbols)
-
+        symbols = db.all_symbols(conn)
         valid = compute_results(conn, run_id, symbols)
         db.prune_old_runs(conn)
 
-        if rate_limited:
-            status = "rate_limited"
-        elif phase == "backfill" and not done:
-            status = "partial"
+        stored = len(db.recent_ok_days(conn, config.WINDOW_DAYS))
+        if ing.caught_up:
+            phase = "incremental"
+        db.set_state(conn, PHASE_KEY, phase)
+        db.set_state(conn, PROGRESS_KEY, stored)
+        db.set_state(conn, PROGRESS_TOTAL_KEY, config.WINDOW_DAYS)
+
+        if ing.error or (ing.blocked and ing.days_ok == 0):
+            status = "error"
+        elif ing.blocked:
+            status = "rate_limited"      # partial progress kept; resumes next run
         else:
             status = "success"
 
-        cursor = int(db.get_state(conn, CURSOR_KEY, 0))
-        msg = f"phase={phase} processed={processed} cursor={cursor}/{len(symbols)}"
-        db.finish_run(conn, run_id, status, processed, valid, errors, bool(rate_limited), msg)
+        latest = db.recent_ok_days(conn, 1)
+        parts = [f"+{ing.days_ok} day(s)",
+                 f"latest {latest[0] if latest else 'none'}",
+                 f"{stored}/{config.WINDOW_DAYS} days stored"]
+        if ing.pending:
+            parts.append(f"awaiting {ing.pending[-1]}")
+        if ing.blocked:
+            parts.append(f"NSE unavailable {ing.blocked}")
+        if ing.error:
+            parts.append(ing.error)
+        parts += problems
+        errors = len(problems) + (1 if ing.blocked or ing.error else 0)
+        db.finish_run(conn, run_id, status, ing.days_ok, valid, errors, bool(ing.blocked),
+                      " | ".join(parts)[:2000], symbols_total=len(symbols))
 
         print(f"Run done in {(time.time() - start) / 60:.1f} min — status={status}, "
-              f"valid={valid}, errors={errors}")
+              f"{src.requests} NSE request(s), valid={valid}, problems={errors}")
         return status
+    except Exception:
+        conn.rollback()
+        if run_id is not None:
+            try:
+                db.finish_run(conn, run_id, "error", 0, 0, 1, False,
+                              traceback.format_exc(limit=3)[-2000:])
+            except Exception:  # noqa: BLE001 - never mask the original error
+                pass
+        raise
     finally:
         conn.close()
+
+
+def probe(today=None):
+    """Check every NSE endpoint from this machine without touching a database.
+
+    Usage: python run.py --probe
+    """
+    src = get_source()
+    today = today or today_ist()
+    healthy = True
+    print(f"Probing NSE archives (today IST {today})")
+    latest = None
+    for back in range(10):
+        d = today - timedelta(days=back)
+        if d.weekday() >= 5:
+            continue
+        try:
+            got = src.fetch_bhavcopy(d)
+        except SourceUnavailable as e:
+            print(f"  bhavcopy {d}: UNAVAILABLE — {e}")
+            healthy = False
+            break
+        if got is None:
+            print(f"  bhavcopy {d}: not published")
+            continue
+        rows, label = got
+        print(f"  bhavcopy {d}: OK — {len(rows)} rows from {label}, e.g. {rows[0]}")
+        latest = d
+        break
+    if latest is None:
+        healthy = False
+    else:
+        try:
+            caps = src.fetch_market_caps(latest)
+            if caps:
+                sym = next(iter(caps))
+                print(f"  market caps {latest}: OK — {len(caps)} symbols, e.g. {sym} {caps[sym]}")
+            else:
+                print(f"  market caps {latest}: PR bundle not published")
+        except SourceUnavailable as e:
+            print(f"  market caps: UNAVAILABLE — {e}")
+            healthy = False
+    for what, fn in (("universe", src.fetch_universe), ("industries", src.fetch_industries)):
+        try:
+            print(f"  {what}: OK — {len(fn())} symbols")
+        except SourceUnavailable as e:
+            print(f"  {what}: UNAVAILABLE — {e}")
+            healthy = False
+    print("Probe", "passed" if healthy else "FAILED", f"({src.requests} requests)")
+    return healthy

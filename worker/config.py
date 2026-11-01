@@ -3,38 +3,78 @@
 All windows are in *trading days*. The rolling history window is 90 days.
 Prices are in INR and market caps in INR (1 crore = 1e7), so e.g.
 5e9 = ₹500 Cr and 1e12 = ₹1,00,000 Cr (1 lakh crore).
+
+Market data comes only from NSE's own end-of-day files (the daily "bhavcopy"
+and companions) on the nsearchives host — one file per trading day carries
+every listed stock, so a daily update is a single download.
 """
 
 # Rolling history window kept per symbol (trading days)
 WINDOW_DAYS = 90
 
-# Suffix appended to NSE symbols when querying Yahoo Finance.
-YAHOO_SUFFIX = ".NS"
+# Calendar days the first backfill walks back. Must cover WINDOW_DAYS trading
+# days plus weekends and exchange holidays (90 × 7/5 ≈ 126, + ~15 slack).
+# Anything beyond WINDOW_DAYS trading days is trimmed after ingest.
+BACKFILL_CALENDAR_DAYS = 145
 
-# How many calendar days the daily incremental fetch should look back.
-# A small buffer covers weekends/holidays; duplicates are de-duped on upsert.
-INCREMENTAL_LOOKBACK_DAYS = 7
+# Only the regular-market series. BE/BZ are trade-for-trade (no intraday,
+# usually illiquid), SM/ST are the SME board — none of them scanner material.
+NSE_SERIES = ("EQ",)
 
-# Backfill chunking: symbols pulled per scheduled run before a clean stop.
-# The NSE main board is ~2,000 symbols, so a single run covers the whole
-# universe; the resume cursor still kicks in if a run is throttled or cut
-# short, picking up next schedule.
-BACKFILL_CHUNK = 10000
+# ---- NSE end-of-day files ---------------------------------------------------
+# Each template is str.format()-ed with d=<datetime.date>. Tried in order; the
+# first that returns a parseable file wins. On weekends only the first is
+# tried (special Saturday/Sunday sessions still publish it).
+BHAVCOPY_URLS = (
+    # CM "UDiFF" common bhavcopy — the official format since 8 Jul 2024.
+    "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{d:%Y%m%d}_F_0000.csv.zip",
+    # Full bhavcopy with delivery data — independent fallback file.
+    "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{d:%d%m%Y}.csv",
+)
+# Daily "PR" press bundle; contains MCAP<DDMMYYYY>.csv (issue size + market cap).
+PR_ZIP_URL = "https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/PR{d:%d%m%y}.zip"
+# Official list of listed equities (symbol, company name, series).
+EQUITY_LIST_URLS = (
+    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+)
+# Index constituent lists — the only NSE file that carries an industry per
+# stock. Nifty Total Market (~750 stocks) first, Nifty 500 as a fallback;
+# stocks outside them get no sector.
+INDUSTRY_LIST_URLS = (
+    "https://nsearchives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv",
+    "https://www.niftyindices.com/IndexConstituent/ind_niftytotalmarket_list.csv",
+    "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+    "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+)
 
-# ---- Rate limiting (cloud / datacenter-IP friendly) ----
-# Minimum seconds between requests across all worker threads.
-MIN_REQUEST_INTERVAL = 0.20
-# Threads. Kept modest because datacenter IPs get throttled faster than home IPs.
-MAX_WORKERS = 8
-# Per-request retry attempts on transient/auth errors before giving up.
+# ---- Politeness / resilience -------------------------------------------------
+# Seconds between requests to NSE (a full backfill is ~150 requests).
+REQUEST_SPACING_SECONDS = 1.0
+REQUEST_TIMEOUT_SECONDS = 60
+# Attempts per URL on 403/429/5xx/network errors before treating NSE as
+# unavailable for this run. 404 is never retried: it means "not published".
 REQUEST_RETRIES = 3
 # Backoff base (seconds): wait = BACKOFF_BASE * 2**attempt (+ jitter).
-BACKOFF_BASE = 2.0
-# Substrings that indicate a Yahoo rate-limit / auth wall (treated as throttle).
-RATE_LIMIT_MARKERS = (
-    "rate limit", "429", "401", "unauthorized", "invalid crumb",
-    "unable to access", "too many requests", "yahoo-finance-api-feedback",
-)
+BACKOFF_BASE = 3.0
+# NSE never closes this many weekdays in a row. Seeing it with no file found
+# means the URL format changed or files moved — fail loudly, don't record
+# fake holidays.
+MAX_CONSECUTIVE_MISSING_WEEKDAYS = 6
+
+# Universe (EQUITY_L) and industry list refresh interval.
+META_REFRESH_DAYS = 7
+
+# ---- Split / bonus back-adjustment -------------------------------------------
+# On an ex-date NSE sets the day's "previous close" to the *adjusted* close.
+# If it differs from our stored close by more than this fraction, every older
+# bar for that symbol is scaled by the ratio (volume inversely), giving a
+# continuous series like an adjusted-price feed.
+ADJUST_MIN_DEVIATION = 0.005
+# Real corporate actions hit a handful of stocks a day. If more than this
+# share of a day's symbols look "adjusted", it's a data gap (e.g. a missed
+# session), not corporate actions — skip adjustments for that day.
+ADJUST_MAX_SHARE = 0.05
 
 # Default trailing-stop % used by the chart's auto-flipping trail.
 DEFAULT_STOP_PCT = 10.0
